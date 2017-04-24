@@ -1,34 +1,38 @@
-extern crate websocket;
 extern crate notify;
+extern crate futures;
+extern crate tokio_core;
+extern crate tokio_tungstenite;
+extern crate tungstenite;
+extern crate multiqueue;
 
-#[macro_use]
-extern crate chan;
-extern crate bus;
-
+use std::io::{Error, ErrorKind};
+use std::sync::mpsc::channel;
 use std::thread;
-use websocket::{Server, Message};
-use websocket::message::Type;
-use websocket::result::WebSocketError;
-use bus::Bus;
+use std::time::Duration;
 
 use notify::{RecommendedWatcher, Watcher, RecursiveMode};
 use notify::DebouncedEvent;
-use std::sync::mpsc::channel;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+
+use futures::Future;
+use futures::stream::Stream;
+use futures::Sink;
+
+use tokio_core::reactor::Core;
+use tokio_core::net::TcpListener;
+use tokio_tungstenite::accept_async;
 
 fn main() {
-	let server = Server::bind("127.0.0.1:3000").unwrap();
-
+	// Start file watch thread
 	let (file_watch_tx, file_watch_rx) = channel();
-	let mut file_watch_bus = Arc::new(Mutex::new(Bus::new(10)));
-	let local_bus = file_watch_bus.clone();
+	let (file_watch_stream_tx, file_watch_stream_rx) = multiqueue::broadcast_fut_queue::<String>(10);
+	// let file_watch_stream_rx = file_watch_stream_rx.wait().ok().unwrap();
+
+	let mut local_file_watch_stream_tx = file_watch_stream_tx.clone();
 
 	let watch_thread = thread::spawn(move || {
+		let mut watcher: RecommendedWatcher = Watcher::new(file_watch_tx, Duration::from_millis(100)).unwrap();
 
-		let mut watcher: RecommendedWatcher = Watcher::new(file_watch_tx, Duration::from_millis(10)).unwrap();
-
-		let watch_path = "YOUR_WATCH_PATH_HERE";
+		let watch_path = "./";
 
 		match watcher.watch(watch_path, RecursiveMode::Recursive) {
 			Ok(_) => println!("Watching path {}", watch_path),
@@ -40,13 +44,10 @@ fn main() {
 				Ok(event) => {
 					match event {
 						DebouncedEvent::Write(path) => {
-							println!("Path write: {}", path.display());
-
 							let path_string: String = path.to_str().unwrap().to_string();
-
-							local_bus.lock().unwrap().broadcast(path_string);
+							local_file_watch_stream_tx = local_file_watch_stream_tx.send(path_string).wait().unwrap();
 						}
-						_ => println!("Something else")
+						_ => {}
 					}
 				}
 				Err(e) => println!("watch error: {:?}", e),
@@ -54,83 +55,70 @@ fn main() {
 		}
 	});
 
-	for request in server.filter_map(Result::ok) {
-		let file_rx_local = file_watch_bus.lock().unwrap().add_rx();
+	// Start websocket server
+	let addr = "127.0.0.1:3000".parse().unwrap();
 
-		thread::spawn(move || {
-			let mut client = request.accept().unwrap();
+	let mut core = Core::new().unwrap();
+	let handle = core.handle();
+	let socket = TcpListener::bind(&addr, &handle).unwrap();
+	println!("Listening on: {}", addr);
 
-			let ip = client.peer_addr().unwrap();
+	let server = socket.incoming().for_each(|(stream, addr)| {
+		println!("{:?}", stream);
+		println!("{:?}", addr);
 
-			println!("Connection from {}", ip);
+		let local_handle = handle.clone();
 
-			let message: Message = Message::text("Welcome".to_string());
-			client.send_message(&message).unwrap();
+		// and_then -> Run after the chained future completes successfully, input is the unwrapped value from the chained future
+		// then     -> Run after the chained future, input is a Result
+		// or_else  -> Run after the chained future returns an error, input is the Error
 
-			let (mut receiver, mut sender) = client.split().unwrap();
+		// All closure return values must implement IntoFuture
 
-			let (ws_tx, ws_rx) = chan::sync(0);
-			let (file_tx, file_rx) = chan::sync(0);
+		let local_file_rx = file_watch_stream_rx.add_stream();
 
-			let client_recv_thread = thread::spawn(move || {
-				for message in receiver.incoming_messages() {
-					ws_tx.send(message);
-				}
-			});
+		accept_async(stream).and_then(move |ws_stream| {
+			println!("{} connected", addr);
 
-			let file_recv_thread = thread::spawn(move || {
-				for r in file_rx_local.into_iter() {
-					file_tx.send(r);
-				}
-			});
+			let (mut sink, stream) = ws_stream.split();
 
-			loop {
-				chan_select! {
-					default => thread::sleep(Duration::from_millis(1000)),
-					file_rx.recv() -> path => {
-						let message: Message = Message::text(path.unwrap());
-						sender.send_message(&message).unwrap();
-					},
-					ws_rx.recv() -> msg => {
-						let msg: Option<Result<Message, WebSocketError>> = msg;
+			let ws_reader = stream
+				.for_each(move |msg: tungstenite::Message| {
+					println!("Message: {:?}", msg);
+					Ok(())
+				}).map(|_| ()).map_err(|_| ());
 
-						match msg {
-							Some(Ok(m)) => {
-								match m.opcode {
-									Type::Close => {
-										let msg = Message::close();
-										let _ = sender.send_message(&msg);
-										println!("Client {} disconnected", ip);
-										return;
-									}
-									Type::Ping => {
-										let msg = Message::pong(m.payload);
-										let _ = sender.send_message(&msg);
-									}
-									_ => {
-										
-									}
-								}
-							}
-							Some(Err(e)) => {
-								println!("Error: {:?}", e);
-								let msg = Message::close();
-								let _ = sender.send_message(&msg);
-								println!("Client {} disconnected", ip);
-								return;
-							}
-							None => {
-								println!("No message received");
-								let msg = Message::close();
-								sender.send_message(&msg);
-							}
-						}
+			// let ws_writer = local_file_rx
+			// 	.fold(sink, |mut sink, msg| {
+			// 		sink.start_send(tungstenite::Message::Text(msg)).unwrap();
+			// 		Ok(sink)
+			// 	})
+			// 	.map(|_| ())
+			// 	.map_err(|_| ());
 
-						let message: Message = Message::text("thanks for the message".to_string());
-						sender.send_message(&message);
-					}
-				}
-			}
-		});
-	}
+			let ws_writer = local_file_rx
+				.for_each(move |msg| {
+					sink.start_send(tungstenite::Message::Text(msg)).unwrap();
+					Ok(())
+				})
+				.map(|_| ())
+				.map_err(|_| ());
+
+			let future_chain = ws_reader
+				.select(ws_writer)
+				.then(move |chain_result| {
+					println!("{} disconnected", addr);
+					Ok(())
+				});
+
+			local_handle.spawn(future_chain);
+
+			Ok(())
+		}).map_err(|e| {
+			println!("Error during the websocket handshake occurred: {}", e);
+			Error::new(ErrorKind::Other, e)
+		})
+	});
+
+	core.run(server).unwrap();
 }

@@ -4,8 +4,11 @@ version = "0.1.0"
 authors = ["Brian Schwind <brianmschwind@gmail.com>"]
 
 [dependencies]
-websocket = "0.19.1"
 notify = "4.0.0"
-# spmc = "0.2.1"
-chan = "0.1.19"
-bus = "1.2.0"
+
+tokio-tungstenite = "0.1.2"
+futures = "0.1.13"
+tokio-io = "0.1"
+tokio-core = "0.1.6"
+tungstenite = "0.2.0"
+multiqueue = "0.3.2"
