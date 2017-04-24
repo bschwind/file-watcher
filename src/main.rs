@@ -3,7 +3,6 @@ extern crate futures;
 extern crate tokio_core;
 extern crate tokio_tungstenite;
 extern crate tungstenite;
-extern crate multiqueue;
 
 use std::io::{Error, ErrorKind};
 use std::sync::mpsc::channel;
@@ -20,16 +19,29 @@ use futures::Sink;
 use tokio_core::reactor::Core;
 use tokio_core::net::TcpListener;
 use tokio_tungstenite::accept_async;
+use tungstenite::Message;
+
+use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use futures::sync::mpsc::UnboundedSender;
 
 fn main() {
+	// Start websocket server
+	let addr = "127.0.0.1:3000".parse().unwrap();
+
+	let mut core = Core::new().unwrap();
+	let handle = core.handle();
+	let socket = TcpListener::bind(&addr, &handle).unwrap();
+	println!("Listening on: {}", addr);
+
+	let connections: Arc<Mutex<HashMap<SocketAddr, UnboundedSender<Message>>>> = Arc::new(Mutex::new(HashMap::new()));
+
 	// Start file watch thread
 	let (file_watch_tx, file_watch_rx) = channel();
-	let (file_watch_stream_tx, file_watch_stream_rx) = multiqueue::broadcast_fut_queue::<String>(10);
-	// let file_watch_stream_rx = file_watch_stream_rx.wait().ok().unwrap();
-
-	let mut local_file_watch_stream_tx = file_watch_stream_tx.clone();
-
+	let file_connections_inner = connections.clone();
 	let watch_thread = thread::spawn(move || {
+
 		let mut watcher: RecommendedWatcher = Watcher::new(file_watch_tx, Duration::from_millis(100)).unwrap();
 
 		let watch_path = "./";
@@ -45,7 +57,13 @@ fn main() {
 					match event {
 						DebouncedEvent::Write(path) => {
 							let path_string: String = path.to_str().unwrap().to_string();
-							local_file_watch_stream_tx = local_file_watch_stream_tx.send(path_string).wait().unwrap();
+
+							let mut conns = file_connections_inner.lock().unwrap();
+							let iter = conns.iter_mut().map(|(_, v)| v);
+
+							for tx in iter {
+								tx.send(Message::Text(path_string.clone())).wait().unwrap();
+							}
 						}
 						_ => {}
 					}
@@ -55,17 +73,9 @@ fn main() {
 		}
 	});
 
-	// Start websocket server
-	let addr = "127.0.0.1:3000".parse().unwrap();
-
-	let mut core = Core::new().unwrap();
-	let handle = core.handle();
-	let socket = TcpListener::bind(&addr, &handle).unwrap();
-	println!("Listening on: {}", addr);
-
 	let server = socket.incoming().for_each(|(stream, addr)| {
-		println!("{:?}", stream);
-		println!("{:?}", addr);
+		let connections_inner = connections.clone();
+		let connections_remover = connections.clone(); // HACK
 
 		let local_handle = handle.clone();
 
@@ -75,38 +85,32 @@ fn main() {
 
 		// All closure return values must implement IntoFuture
 
-		let local_file_rx = file_watch_stream_rx.add_stream();
-
 		accept_async(stream).and_then(move |ws_stream| {
 			println!("{} connected", addr);
 
-			let (mut sink, stream) = ws_stream.split();
+			let (tx, rx) = futures::sync::mpsc::unbounded();
+			connections_inner.lock().unwrap().insert(addr, tx);
+
+			let (sink, stream) = ws_stream.split();
 
 			let ws_reader = stream
-				.for_each(move |msg: tungstenite::Message| {
-					println!("Message: {:?}", msg);
+				.for_each(move |msg: Message| {
+					println!("Got a message from {}: {:?}", addr, msg);
 					Ok(())
 				}).map(|_| ()).map_err(|_| ());
 
-			// let ws_writer = local_file_rx
-			// 	.fold(sink, |mut sink, msg| {
-			// 		sink.start_send(tungstenite::Message::Text(msg)).unwrap();
-			// 		Ok(sink)
-			// 	})
-			// 	.map(|_| ())
-			// 	.map_err(|_| ());
-
-			let ws_writer = local_file_rx
-				.for_each(move |msg| {
-					sink.start_send(tungstenite::Message::Text(msg)).unwrap();
-					Ok(())
+			let ws_writer = rx
+				.fold(sink, |mut sink, msg| {
+					sink.start_send(msg).unwrap();
+					Ok(sink)
 				})
 				.map(|_| ())
 				.map_err(|_| ());
 
 			let future_chain = ws_reader
 				.select(ws_writer)
-				.then(move |chain_result| {
+				.then(move |_| {
+					connections_remover.lock().unwrap().remove(&addr);
 					println!("{} disconnected", addr);
 					Ok(())
 				});
