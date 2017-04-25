@@ -89,23 +89,26 @@ fn main() {
 			println!("{} connected", addr);
 
 			let (tx, rx) = futures::sync::mpsc::unbounded();
+
+			// In order to forward messages from rx to the sink, the Error type must be tungstenite::Error
+			// rx will now be a Stream<Item = Message, Error = tungstenite::Error>
+			let rx = rx.map_err(|_| tungstenite::Error::Io(Error::new(ErrorKind::Other, "Futures Channel RX Error")));
+
 			connections_inner.lock().unwrap().insert(addr, tx);
 
 			let (sink, stream) = ws_stream.split();
 
+			// This stream will accept each message from the client and just print it. Type is Stream<Item = (), Error = tungstenite::Error>
 			let ws_reader = stream
 				.for_each(move |msg: Message| {
 					println!("Got a message from {}: {:?}", addr, msg);
 					Ok(())
-				}).map(|_| ()).map_err(|_| ());
+				});
 
+			// This stream simply forwards all messages from the channel (from the file watch thread) to the client
 			let ws_writer = rx
-				.fold(sink, |mut sink, msg| {
-					sink.start_send(msg).unwrap();
-					Ok(sink)
-				})
-				.map(|_| ())
-				.map_err(|_| ());
+				.forward(sink)
+				.map(|_| ()); // Map to Stream<Item = (), Error = tungstenite::Error> so we can pass it to .select()
 
 			let future_chain = ws_reader
 				.select(ws_writer)
@@ -125,4 +128,5 @@ fn main() {
 	});
 
 	core.run(server).unwrap();
+	watch_thread.join().unwrap();
 }
