@@ -75,7 +75,6 @@ fn main() {
 
 	let server = socket.incoming().for_each(|(stream, addr)| {
 		let connections_inner = connections.clone();
-		let connections_remover = connections.clone(); // HACK
 
 		let local_handle = handle.clone();
 
@@ -113,7 +112,7 @@ fn main() {
 			let future_chain = ws_reader
 				.select(ws_writer)
 				.then(move |_| {
-					connections_remover.lock().unwrap().remove(&addr);
+					connections_inner.lock().unwrap().remove(&addr);
 					println!("{} disconnected", addr);
 					Ok(())
 				});
