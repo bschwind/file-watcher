@@ -4,10 +4,10 @@ version = "0.1.0"
 authors = ["Brian Schwind <brianmschwind@gmail.com>"]
 
 [dependencies]
-notify = "4.0.0"
+notify = "4"
 
-tokio-tungstenite = "0.1.2"
-futures = "0.1.13"
+tokio-tungstenite = "0.1"
+futures = "0.1"
 tokio-io = "0.1"
-tokio-core = "0.1.6"
-tungstenite = "0.2.0"
+tokio-core = "0.1"
+tungstenite = "0.2"
